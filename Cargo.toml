@@ -1,0 +1,11 @@
+[package]
+name = "dusty-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+slack-morphism = { version = "2.5.0", features = ["hyper"] }
+hyper = "1.5.0"
+serde = { version = "1.0.214", features = ["derive"] }
+tokio = "1.41.0"
+serde_json = "1.0.132"
