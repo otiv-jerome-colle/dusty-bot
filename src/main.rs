@@ -1,69 +1,156 @@
+mod dusty;
+
 use slack_morphism::prelude::*;
-use hyper::client::HttpConnector;
-use hyper::Client;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use serde::{Deserialize, Serialize};
-use tokio;
 
-const LOCATION_FILE: &str = "location.json";
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::Response;
+use tracing::*;
 
-// Define a struct for storing Dusty's location
-#[derive(Serialize, Deserialize, Default)]
-struct Location {
-    location: String,
+use axum::Extension;
+use std::convert::Infallible;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+
+async fn test_oauth_install_function(
+    resp: SlackOAuthV2AccessTokenResponse,
+    _client: Arc<SlackHyperClient>,
+    _states: SlackClientEventsUserState,
+) {
+    println!("{:#?}", resp);
 }
 
-// Helper functions to get and set the location in a JSON file
-fn get_location() -> String {
-    let mut file = File::open(LOCATION_FILE).unwrap_or_else(|_| File::create(LOCATION_FILE).unwrap());
-    let mut data = String::new();
-    file.read_to_string(&mut data).unwrap();
-
-    let location: Location = serde_json::from_str(&data).unwrap_or_default();
-    location.location
+async fn test_welcome_installed() -> String {
+    "Welcome".to_string()
 }
 
-fn set_location(new_location: &str) {
-    let location = Location {
-        location: new_location.to_string(),
-    };
-    let data = serde_json::to_string(&location).unwrap();
-    let mut file = OpenOptions::new().write(true).truncate(true).open(LOCATION_FILE).unwrap();
-    file.write_all(data.as_bytes()).unwrap();
+async fn test_cancelled_install() -> String {
+    "Cancelled".to_string()
+}
+
+async fn test_error_install() -> String {
+    "Error while installing".to_string()
+}
+
+async fn test_push_event(
+    Extension(_environment): Extension<Arc<SlackHyperListenerEnvironment>>,
+    Extension(event): Extension<SlackPushEvent>,
+) -> Response<BoxBody<Bytes, Infallible>> {
+    println!("Received push event: {:?}", event);
+
+    match event {
+        SlackPushEvent::UrlVerification(url_ver) => {
+            Response::new(Full::new(url_ver.challenge.into()).boxed())
+        }
+        _ => Response::new(Empty::new().boxed()),
+    }
+}
+
+async fn test_command_event(
+    Extension(_environment): Extension<Arc<SlackHyperListenerEnvironment>>,
+    Extension(event): Extension<SlackCommandEvent>,
+) -> axum::Json<SlackCommandEventResponse> {
+    println!("Received command event: {:?}", event);
+    axum::Json(SlackCommandEventResponse::new(
+        SlackMessageContent::new().with_text("Working on it".into()),
+    ))
+}
+
+async fn test_interaction_event(
+    Extension(_environment): Extension<Arc<SlackHyperListenerEnvironment>>,
+    Extension(event): Extension<SlackInteractionEvent>,
+) {
+    println!("Received interaction event: {:?}", event);
+}
+
+fn test_error_handler(
+    err: Box<dyn std::error::Error + Send + Sync>,
+    _client: Arc<SlackHyperClient>,
+    _states: SlackClientEventsUserState,
+) -> HttpStatusCode {
+    println!("{:#?}", err);
+
+    // Defines what we return Slack server
+    HttpStatusCode::BAD_REQUEST
+}
+
+async fn test_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client: Arc<SlackHyperClient> =
+        Arc::new(SlackClient::new(SlackClientHyperConnector::new()?));
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
+    info!("Loading server: {}", addr);
+
+    let oauth_listener_config = SlackOAuthListenerConfig::new(
+        config_env_var("SLACK_CLIENT_ID")?.into(),
+        config_env_var("SLACK_CLIENT_SECRET")?.into(),
+        config_env_var("SLACK_BOT_SCOPE")?,
+        config_env_var("SLACK_REDIRECT_HOST")?,
+    );
+
+    let listener_environment: Arc<SlackHyperListenerEnvironment> = Arc::new(
+        SlackClientEventsListenerEnvironment::new(client.clone())
+            .with_error_handler(test_error_handler),
+    );
+    let signing_secret: SlackSigningSecret = config_env_var("SLACK_SIGNING_SECRET")?.into();
+
+    let listener: SlackEventsAxumListener<SlackHyperHttpsConnector> =
+        SlackEventsAxumListener::new(listener_environment.clone());
+
+    // build our application route with OAuth nested router and Push/Command/Interaction events
+    let app = axum::routing::Router::new()
+        .nest(
+            "/auth",
+            listener.oauth_router("/auth", &oauth_listener_config, test_oauth_install_function),
+        )
+        .route("/installed", axum::routing::get(test_welcome_installed))
+        .route("/cancelled", axum::routing::get(test_cancelled_install))
+        .route("/error", axum::routing::get(test_error_install))
+        .route(
+            "/push",
+            axum::routing::post(test_push_event).layer(
+                listener
+                    .events_layer(&signing_secret)
+                    .with_event_extractor(SlackEventsExtractors::push_event()),
+            ),
+        )
+        .route(
+            "/command",
+            axum::routing::post(test_command_event).layer(
+                listener
+                    .events_layer(&signing_secret)
+                    .with_event_extractor(SlackEventsExtractors::command_event()),
+            ),
+        )
+        .route(
+            "/interaction",
+            axum::routing::post(test_interaction_event).layer(
+                listener
+                    .events_layer(&signing_secret)
+                    .with_event_extractor(SlackEventsExtractors::interaction_event()),
+            ),
+        );
+
+    axum::serve(TcpListener::bind(&addr).await.unwrap(), app)
+        .await
+        .unwrap();
+
+    Ok(())
+}
+
+pub fn config_env_var(name: &str) -> Result<String, String> {
+    std::env::var(name).map_err(|e| format!("{}: {}", name, e))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Initialize HTTP connector with hyper
-    let hyper_connector = HttpConnector::new();
-    let hyper_client = Client::builder().build(hyper_connector);
-    let client = SlackClient::new(hyper_client);
+    let subscriber = tracing_subscriber::fmt()
+        // .with_env_filter("axum_events_api_server=debug,slack_morphism=debug")
+        .finish();
+    subscriber::set_global_default(subscriber)?;
 
-    // Setup OAuth access
-    let slack_token_value = SlackApiToken::new("your-slack-bot-token".into());
-    let session = SlackClientSession::new(client.clone(), slack_token_value);
+    test_server().await?;
 
-    // Listen to incoming messages
-    let listener = SlackEventListener::new().message_event(|event| async move {
-        if let Some(text) = &event.text {
-            // Handle "Where is Dusty?" query
-            if text.trim() == "Where is Dusty?" {
-                let location = get_location();
-                let response_text = format!("Dusty is at {}", location);
-                session.chat_post_message(event.channel.clone(), response_text).await.ok();
-            }
-            // Handle location update in "Dusty is at PX.ABC" format
-            else if let Some(captures) = text.trim().strip_prefix("Dusty is at ") {
-                set_location(captures);
-                let response_text = format!("Got it! Dusty is now at {}", captures);
-                session.chat_post_message(event.channel.clone(), response_text).await.ok();
-            }
-        }
-        Ok(())
-    });
-
-    // Run the bot
-    client.listen_with(listener).await?;
     Ok(())
 }
