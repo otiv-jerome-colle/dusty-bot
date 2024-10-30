@@ -8,14 +8,11 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::Response;
 use tracing::*;
 
-use crate::dusty::DustyLocation;
-use anyhow::Error;
 use axum::Extension;
 use std::convert::Infallible;
 use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing_subscriber::fmt::format;
 
 async fn test_oauth_install_function(
     resp: SlackOAuthV2AccessTokenResponse,
@@ -24,15 +21,6 @@ async fn test_oauth_install_function(
 ) {
     println!("{:#?}", resp);
 }
-
-async fn test_welcome_installed() -> String {
-    "Welcome".to_string()
-}
-
-async fn test_cancelled_install() -> String {
-    "Cancelled".to_string()
-}
-
 async fn test_error_install() -> String {
     "Error while installing".to_string()
 }
@@ -61,26 +49,7 @@ async fn test_push_event(
                 return Response::new(Empty::new().boxed());
             };
 
-            let response = if text.to_lowercase() == "where is dusty?" {
-                match dusty::get_location() {
-                    Ok(location) => format!("Dusty is at {location}"),
-                    Err(e) => {
-                        warn!("{e}");
-                        "Something went wrong, I don't know.".to_string()
-                    }
-                }
-            } else if text.to_lowercase().starts_with("dusty is at ") {
-                let new_location = text["Dusty is at ".len()..].trim();
-                match dusty::set_location(new_location) {
-                    Ok(_) => "Got it!".to_string(),
-                    Err(e) => {
-                        warn!("{e}");
-                        "Something went wrong, I couldn't save Dusty's location".to_string() 
-                    }
-                }
-            } else {
-                "I don't understand that. Please either ask 'Where is Dusty?', or tell me 'Dusty is at P<floor>.<space>' (example: 'Dusty is at P1.303')".to_string()
-            };
+            let response = dusty::handle_dusty_query(&text);
 
             if !response.is_empty() {
                 let message_content = SlackMessageContent::new().with_text(response);
@@ -105,24 +74,6 @@ async fn test_push_event(
         _ => Response::new(Empty::new().boxed()),
     }
 }
-
-async fn test_command_event(
-    Extension(_environment): Extension<Arc<SlackHyperListenerEnvironment>>,
-    Extension(event): Extension<SlackCommandEvent>,
-) -> axum::Json<SlackCommandEventResponse> {
-    println!("Received command event: {:?}", event);
-    axum::Json(SlackCommandEventResponse::new(
-        SlackMessageContent::new().with_text("Working on it".into()),
-    ))
-}
-
-async fn test_interaction_event(
-    Extension(_environment): Extension<Arc<SlackHyperListenerEnvironment>>,
-    Extension(event): Extension<SlackInteractionEvent>,
-) {
-    println!("Received interaction event: {:?}", event);
-}
-
 fn test_error_handler(
     err: Box<dyn std::error::Error + Send + Sync>,
     _client: Arc<SlackHyperClient>,
@@ -163,8 +114,6 @@ async fn test_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "/auth",
             listener.oauth_router("/auth", &oauth_listener_config, test_oauth_install_function),
         )
-        .route("/installed", axum::routing::get(test_welcome_installed))
-        .route("/cancelled", axum::routing::get(test_cancelled_install))
         .route("/error", axum::routing::get(test_error_install))
         .route(
             "/push",
@@ -172,22 +121,6 @@ async fn test_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 listener
                     .events_layer(&signing_secret)
                     .with_event_extractor(SlackEventsExtractors::push_event()),
-            ),
-        )
-        .route(
-            "/command",
-            axum::routing::post(test_command_event).layer(
-                listener
-                    .events_layer(&signing_secret)
-                    .with_event_extractor(SlackEventsExtractors::command_event()),
-            ),
-        )
-        .route(
-            "/interaction",
-            axum::routing::post(test_interaction_event).layer(
-                listener
-                    .events_layer(&signing_secret)
-                    .with_event_extractor(SlackEventsExtractors::interaction_event()),
             ),
         );
 
